@@ -1,0 +1,34 @@
+#
+# /etc/sudoers
+#
+# This file MUST be edited with the 'visudo' command as root.
+# Editing it directly with a normal text editor risks leaving it
+# syntactically broken, which locks out sudo entirely.
+#
+# See the sudoers man page for details on how to write a sudoers file.
+#
+
+Defaults	env_reset
+Defaults	mail_badpass
+Defaults	secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+
+# Preserve some environment variables from the user's shell when running
+# commands under sudo (safe, common defaults)
+Defaults	env_keep += "LANG LANGUAGE LC_* EDITOR"
+
+# Uncomment to allow members of group sudo to run any command without
+# a password. Handy on single-user boxes, but weaker security-wise —
+# only uncomment if you know you want this.
+#%sudo	ALL=(ALL:ALL) NOPASSWD:ALL
+
+# User privilege specification
+root	ALL=(ALL:ALL) ALL
+
+# Members of the admin group may gain root privileges
+%admin	ALL=(ALL) ALL
+
+# Allow members of group sudo to execute any command
+%sudo	ALL=(ALL:ALL) ALL
+
+# Read drop-in files from /etc/sudoers.d
+#includedir /etc/sudoers.d
