@@ -1,422 +1,569 @@
-#!/bin/bash
-CURRENT_VERSION="v1.3.21-JackSparrow"
+#!/usr/bin/env bash
+# iPhone6Tether8.0 - Linux edition
+# Tethered (seprmvr64) downgrade strictly for iPhone 6 (iPhone7,2 / n61ap / A8) -> iOS 8.3 (12F70)
+CURRENT_VERSION="v1.4.0-linux-8.3"
 
-clear
-set -euo pipefail
+set -Eeuo pipefail
 
-error_handler() {
-    local exit_code=$?
-    local failed_command="$BASH_COMMAND"
-    local line_number="${BASH_LINENO[0]}"
-    local script_file="${BASH_SOURCE[1]:-$0}"
+cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ROOT="$PWD"
+export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    {
-        echo "[!] Shiver me timbers! The script ran aground!"
-        echo "[!] Exit code: $exit_code"
-        echo "[!] Script: $script_file"
-        echo "[!] Line: $line_number"
-        echo "[!] Failed command: $failed_command"
-    } 
-    exit "$exit_code"
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+IDENTIFIER="iPhone7,2"
+BOARD="n61ap"
+CPID="0x7000"                 # A8
+TARGET_DEFAULT="8.3"          # iPhone_4.7_8.3_12F70_Restore.ipsw
+LATEST_VERSION="12.5.8"       # signed base used for the restore
+MAX_PWN_TRIES=5
+RESTORE_BOOTARGS="rd=md0 debug=0x2014e -v wdt=-1 nand-enable-reformat=1 -restore amfi=0xff cs_enforcement_disable=1"
+BOOT_BOOTARGS="-v rd=disk0s1s1${EXTRA_BOOTARGS:+ $EXTRA_BOOTARGS}"
+SSH_PORT=6414                 # SSH ramdisk (iproxy 6414 22)
+
+ECID_DEC=""; SERIAL=""; MODE_NOW=""
+KEY_IBSS=""; KEY_IBEC=""; KEY_DTRE=""; KEY_RDSK=""; KEY_KRNL=""; KEY_FSTM=""
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+log()  { printf '[*] %s\n' "$*"; }
+ok()   { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+on_err() {
+  local rc=$?
+  warn "Script failed (exit $rc) at line ${BASH_LINENO[0]}: $BASH_COMMAND"
+  exit "$rc"
+}
+trap on_err ERR
+
+as_root() {
+  if [[ $EUID -eq 0 ]]; then "$@"; else sudo env "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" "$@"; fi
 }
 
-trap 'error_handler $LINENO' ERR
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing '$1'. Install it with your package manager."; }
 
-echo "A8Phorin/iPhone6to8.0 - $CURRENT_VERSION"
-echo "Tether Downgrader strictly for the iPhone 6 (iPhone7,2) to iOS 8.0, savvy?"
-echo ""
-
-# Request sudo password upfront
-echo "Hand over the keys to the ship (Enter yer sudo password):"
-sudo -v || exit 1
-
-dist=0
-DISTRO="Unsupported"
-ARCH="$(uname -m)"
-
-if [[ "$(uname)" == "Darwin" ]]; then
-    DISTRO="macOS"
-    dist=3
-elif [[ -r /etc/os-release ]]; then
-    . /etc/os-release
-    if [[ "$ID" == "arch" || "${ID_LIKE:-}" == *arch* ]]; then
-        DISTRO="Arch"
-        dist=2
-    elif [[ "$ID" == "debian" || "${ID_LIKE:-}" == *debian* ]]; then
-        DISTRO="Debian"
-        dist=1
-    fi
-fi
-
-if [[ $dist == 3 || $dist == 4 ]]; then
-    zenity="./bin/zenity"
-else
-    zenity="zenity"
-fi
-
-stat_size() {
-    if stat -c %s "$1" >/dev/null 2>&1; then
-        stat -c %s "$1"
-    else
-        stat -f %z "$1"
-    fi
+to_dec() {
+  local v="${1//[[:space:]]/}"
+  if [[ $v == 0x* || $v == 0X* ]]; then printf '%d' "$v"; else printf '%s' "$v"; fi
 }
 
-find_dmg() {
-    dir="$1"
-    mode="$2"
-    max_size="${3:-}"
+usage() {
+  cat <<EOF
+Usage: $0 <command>
 
-    find "$dir" -type f -name '*.dmg' ! -name '._*' -print |
-    while IFS= read -r f; do
-        size=$(stat_size "$f") || continue
-        if [[ -n "$max_size" && "$size" -ge "$max_size" ]]; then
-            continue
-        fi
-        printf '%s %s\n' "$size" "$f"
-    done |
-    if [[ "$mode" == "smallest" ]]; then
-        sort -n
-    else
-        sort -nr
-    fi |
-    head -n 1 |
-    cut -d' ' -f2-
-}
+  --ipsw TARGET.ipsw BASE_12.5.8.ipsw [VERSION] [--stitch-activation]
+  --seprmvr64-ipsw ...        (same as --ipsw)
+      Build a custom IPSW (default VERSION: $TARGET_DEFAULT). Activation records are
+      always stitched in, Setup.app is deleted and auto-lock is set to Never.
+      Example: $0 --ipsw iPhone_4.7_8.3_12F70_Restore.ipsw iPhone_4.7_12.5.8_Restore.ipsw 8.3
 
-require_file() {
-    if [[ ! -f "$1" ]]; then
-        echo "[!] Blimey! Missing a vital piece of eight: $1"
-        exit 1
-    fi
-}
+  --restore [VERSION]         (alias: --seprmvr64-restore)
+      Put the phone in DFU, pwn it (with retries) and restore the custom IPSW.
 
-echo "[*] Checkin' for the /bin/ chest..."
-if [[ ! -d "bin" ]]; then
-    echo "[!] Ye don't have the /bin/ folder! Walk the plank!"
-    exit 1
-fi
+  --fix-ios8                  Patch dyld over the SSH ramdisk (fixes "Slide to Upgrade"),
+                              delete Setup.app and disable auto-lock/sleep. Run after restoring.
 
-IDEVICE_INFO=$(ideviceinfo 2>&1) || true
-IDEVICE_STATUS=$?
+  boot [VERSION] [IPSW]       (alias: --boot, --seprmvr64-boot)
+      Tethered boot. Needed after every reboot / power off.
 
-if [[ $IDEVICE_STATUS -eq 0 && "$IDEVICE_INFO" != *"No device found!"* ]]; then
-    echo "[*] Vessel spotted in normal mode."
-    IDENTIFIER=$(echo "$IDEVICE_INFO" | grep "^ProductType:" | cut -d ':' -f2 | xargs)
-    ECID=$(echo "$IDEVICE_INFO" | grep "^UniqueChipID:" | cut -d ':' -f2 | xargs)
-    SERIAL=$(echo "$IDEVICE_INFO" | grep "^SerialNumber:" | cut -d ':' -f2 | xargs)
-    DEVICE_VERSION=$(echo "$IDEVICE_INFO" | grep "^ProductVersion:" | cut -d ':' -f2 | xargs)
-else
-    echo "[*] Vessel ain't in normal mode. Checking the depths (recovery/DFU)..."
-    IRECOVERY_INFO=$(./bin/irecovery -q 2>/dev/null) || true
-    if [[ -n "$IRECOVERY_INFO" ]]; then
-        IDENTIFIER=$(echo "$IRECOVERY_INFO" | grep "^PRODUCT:" | cut -d ':' -f2 | xargs)
-        ECID=$(echo "$IRECOVERY_INFO" | grep "^ECID:" | cut -d ':' -f2 | xargs)
-    else
-        echo "[!] No vessel detected. Check yer cables!"
-        exit 1
-    fi
-fi
-
-echo "[+] Device Identifier: $IDENTIFIER"
-echo "[+] ECID: $ECID"
-
-if [[ "$IDENTIFIER" != "iPhone7,2" ]]; then
-    echo "[!] Avast! This script be forged ONLY for the iPhone 6 (iPhone7,2). Ye brought me a $IDENTIFIER!"
-    exit 1
-fi
-
-LATEST_VERSION="12.5.8"
-IBSS="iBSS.n61.RELEASE.im4p"
-IBEC="iBEC.n61.RELEASE.im4p"
-DEVICETREE="DeviceTree.n61ap.im4p"
-ALLFLASH="all_flash.n61ap.production"
-IBSS10="iBSS.n61.RELEASE.im4p"
-IBEC10="iBEC.n61.RELEASE.im4p"
-IBSS7="iBSS.n61ap.RELEASE.im4p"
-IBEC7="iBEC.n61ap.RELEASE.im4p"
-KERNELCACHE10="kernelcache.release.n61"
-LLB="LLB.n61.RELEASE.im4p"
-IBOOT="iBoot.n61.RELEASE.im4p"
-USE_BASEBAND="--latest-baseband"
-
-function usage() {
-    cat <<EOF
-Usage: $0 [OPTIONS]
-
-Options:
-  --seprmvr64-ipsw [TARGET_IPSW] [BASE_IPSW] [iOS_VERSION] [--stitch-activation]
-        Create a custom IPSW for tethered restore with seprmvr64.
-        Example: ./downgrade.sh --seprmvr64-ipsw 8.0.ipsw 12.5.8.ipsw 8.0 --stitch-activation
-
-  --seprmvr64-restore [iOS_VERSION]
-        Restore the device to a previously created custom IPSW.
-
-  --seprmvr64-boot [iOS_VERSION]
-        Perform a tethered boot.
-
-  --fix-ios8
-        Fixes dyld over SSH ramdisk so iOS 8 won't get stuck at Slide to Upgrade. Run this after restoring!
+Env: EXTRA_BOOTARGS="..." adds boot-args to the tethered boot, SKIP_GO=1 skips 'irecovery -c go'.
 EOF
 }
 
-if [[ $# -eq 0 ]]; then
-    usage
+# ----------------------------------------------------------------------------
+# Environment checks
+# ----------------------------------------------------------------------------
+check_env() {
+  [[ "$(uname -s)" == "Linux" ]] || die "This is the Linux edition."
+  for c in unzip zip curl perl awk find df; do need_cmd "$c"; done
+  [[ -d bin ]] || die "No ./bin folder. Run this from the repo root."
+  local b missing=()
+  for b in irecovery gaster img4 img4tool hfsplus dmg asr64_patcher ldid restoredpatcher \
+           ipatcher Kernel64Patcher2 kerneldiff tsschecker idevicerestore sshpass dsc64patcher; do
+    [[ -f bin/$b ]] || missing+=("$b")
+  done
+  ((${#missing[@]} == 0)) || die "Missing binaries in ./bin: ${missing[*]}"
+  chmod +x bin/* 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------------
+# Device / DFU handling
+# ----------------------------------------------------------------------------
+stop_usbmuxd()  { as_root systemctl stop usbmuxd >/dev/null 2>&1 || true; as_root pkill -x usbmuxd >/dev/null 2>&1 || true; }
+start_usbmuxd() {
+  as_root systemctl start usbmuxd >/dev/null 2>&1 || (as_root usbmuxd -pf >/dev/null 2>&1 &)
+  sleep 2
+}
+
+irq()          { as_root "$ROOT/bin/irecovery" -q 2>/dev/null || true; }
+current_mode() { irq | awk -F': *' '/^MODE:/{gsub(/\r/,"",$2); print $2; exit}'; }
+
+wait_for_mode() {
+  local want="$1" timeout="${2:-30}" i m
+  for ((i = 0; i < timeout; i++)); do
+    m="$(current_mode)"
+    [[ "$m" == "$want" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+detect_device() {
+  local info=""
+  # normal mode
+  if command -v ideviceinfo >/dev/null 2>&1 && info="$(ideviceinfo 2>/dev/null)" && [[ -n "$info" ]]; then
+    MODE_NOW="normal"
+    IDENT_FOUND="$(awk -F': ' '/^ProductType:/{print $2}' <<<"$info" | tr -d '\r ')"
+    ECID_DEC="$(awk -F': ' '/^UniqueChipID:/{print $2}' <<<"$info" | tr -d '\r ')"
+    SERIAL="$(awk -F': ' '/^SerialNumber:/{print $2}' <<<"$info" | tr -d '\r ')"
+  # recovery / DFU
+  elif info="$(irq)" && [[ -n "$info" ]]; then
+    MODE_NOW="$(awk -F': *' '/^MODE:/{gsub(/\r/,"",$2); print $2; exit}' <<<"$info")"
+    IDENT_FOUND="$(awk -F': *' '/^PRODUCT:/{gsub(/\r/,"",$2); print $2; exit}' <<<"$info")"
+    ECID_DEC="$(to_dec "$(awk -F': *' '/^ECID:/{gsub(/\r/,"",$2); print $2; exit}' <<<"$info")")"
+  else
+    die "No device found. Check the cable (try a USB 2.0 port) and that the phone is on or in DFU."
+  fi
+  [[ "$IDENT_FOUND" == "$IDENTIFIER" ]] || die "This script is for the iPhone 6 ($IDENTIFIER) only. Found: ${IDENT_FOUND:-unknown}"
+  [[ -n "$ECID_DEC" ]] || die "Could not read the ECID."
+  ok "Device: $IDENT_FOUND  ECID: $ECID_DEC  Mode: ${MODE_NOW:-unknown}"
+}
+
+dfu_instructions() {
+  cat <<'EOF'
+    Enter DFU on the iPhone 6:
+      1. Plug in the cable. Turn the phone off or leave it on.
+      2. Hold Power + Home together for 8-10 seconds.
+      3. Release Power, KEEP holding Home for another ~8 seconds.
+      4. Screen must stay completely black (no logo, no "connect to iTunes").
+EOF
+}
+
+pwn_device() {
+  local try info
+  stop_usbmuxd                     # usbmuxd grabbing the USB device is the #1 cause of failed pwns on Linux
+  for ((try = 1; try <= MAX_PWN_TRIES; try++)); do
+    log "PWNDFU attempt $try/$MAX_PWN_TRIES"
+    if [[ "$(current_mode)" != "DFU" ]]; then
+      dfu_instructions
+      read -r -p "    Press Enter once the phone is in DFU... " _
+      if ! wait_for_mode DFU 15; then warn "Phone not seen in DFU mode."; continue; fi
+    fi
+
+    info="$(irq)"
+    grep -q "PRODUCT: $IDENTIFIER" <<<"$info" || die "DFU device is not an $IDENTIFIER. Aborting."
+    grep -qi "CPID: $CPID" <<<"$info" || warn "CPID is not $CPID (A8) - continuing anyway."
+
+    if grep -q 'PWND' <<<"$info"; then ok "Already in PWNDFU."; return 0; fi
+
+    as_root "$ROOT/bin/gaster" pwn || warn "gaster pwn returned an error."
+    sleep 1
+    as_root "$ROOT/bin/gaster" reset || warn "gaster reset returned an error."
+    sleep 1
+
+    if irq | grep -q 'PWND'; then ok "PWNDFU verified."; return 0; fi
+    warn "Not pwned. Re-enter DFU (unplug, power off, redo the button combo) and retry."
+    as_root "$ROOT/bin/irecovery" -n >/dev/null 2>&1 || true   # leave the device out of a half-state if possible
+    sleep 2
+  done
+  die "Could not get PWNDFU after $MAX_PWN_TRIES attempts. Try another USB port/cable (USB-A 2.0 works best)."
+}
+
+irec_try() {
+  local n
+  for n in 1 2 3; do
+    as_root "$ROOT/bin/irecovery" "$@" && return 0
+    sleep 2
+  done
+  die "'irecovery $*' failed 3 times. Re-enter DFU and run the command again."
+}
+
+# ----------------------------------------------------------------------------
+# Key / IPSW helpers
+# ----------------------------------------------------------------------------
+load_keys() {
+  local ver="$1"; shift
+  local keyfile="keys/$IDENTIFIER.txt" k v missing=()
+  [[ -f "$keyfile" ]] || die "Missing $keyfile"
+  for k in "$@"; do
+    v="$(grep -m1 "^$k-$ver:" "$keyfile" | cut -d: -f2- | tr -d ' \r' || true)"
+    [[ -n "$v" ]] || missing+=("$k-$ver")
+    printf -v "KEY_${k^^}" '%s' "$v"
+  done
+  if ((${#missing[@]})); then
+    warn "No keys for iOS $ver in $keyfile: ${missing[*]}"
+    warn "Easiest: run 'python3 downgrade_gui.py' and use 'Import keys...' with the copied wiki page"
+    warn "(theapplewiki: Keys:Stowe_12F70_(iPhone7,2)). Or add lines like 'ibss-$ver:<IV+KEY hex>' by hand;"
+    warn "ibss/ibec/dtre/rdsk/krnl = IV+Key (96 hex), fstm = rootfs key only (72 hex)."
     exit 1
-fi
+  fi
+}
 
-case "$1" in
-    --seprmvr64-ipsw)
-        TARGET_IPSW="$2"
-        BASE_IPSW="$3"
-        IOS_VERSION="$4"
-        FORCE_ACTIVATE=1 # Hardcoded for 8.x
+stat_size() { stat -c %s "$1"; }
 
-        if [[ "$IOS_VERSION" != "8.0" ]]; then
-            echo "[!] This map leads to 8.0 only, savvy? But if ye insist on $IOS_VERSION, we shall proceed..."
-        fi
+find_dmg() { # dir smallest|largest
+  find "$1" -type f -name '*.dmg' ! -name '._*' -print0 |
+    while IFS= read -r -d '' f; do printf '%s %s\n' "$(stat_size "$f")" "$f"; done |
+    { if [[ "$2" == smallest ]]; then sort -n; else sort -nr; fi; } |
+    head -n 1 | cut -d' ' -f2-
+}
 
-        echo "[!] Activation records are REQUIRED for this voyage."
-        echo "[!] Make sure yer vessel is on the latest iOS, fully activated, jailbroken, and has OpenSSH installed."
-        
-        # Normalize ECID
-        if [[ "$ECID" == 0x* || "$ECID" == 0X* ]]; then
-            ECID_CLEAN="${ECID#0x}"
-            ECID_CLEAN="${ECID_CLEAN#0X}"
-            ECID_DEC=$(printf '%d' "0x$ECID_CLEAN")
-        else
-            ECID_DEC="$ECID"
-        fi
-        CACHE_FILE="cache/$ECID_DEC"
-        CACHED_SERIAL=$SERIAL
+manifest_path() { # BuildManifest.plist component
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import plistlib, sys
+m = plistlib.load(open(sys.argv[1], 'rb'))
+for ident in m.get('BuildIdentities', []):
+    if ident.get('Info', {}).get('RestoreBehavior') == 'Erase':
+        e = ident.get('Manifest', {}).get(sys.argv[2])
+        if e:
+            print(e['Info']['Path'])
+            break
+PY
+}
 
-        if [[ ! -f "activation_records/$CACHED_SERIAL/activation_record.plist" ]]; then
-            echo "[!] Let's plunder yer activation records over SSH!"
-            mkdir -p activation_records/$CACHED_SERIAL/
-            read -p "Insert the IP of yer device: " ip_address
-            read -p "Enter the SSH Password (usually 'alpine'): " sshpwd
-            CONNECT_AS="root"
+pick_dmg() { # dir component fallback-mode
+  local p
+  p="$(manifest_path "$1/BuildManifest.plist" "$2")"
+  if [[ -n "$p" && -f "$1/$p" ]]; then printf '%s\n' "$1/$p"; else find_dmg "$1" "$3"; fi
+}
 
-            sudo ./bin/sshpass -p "$sshpwd" scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no $CONNECT_AS@"$ip_address":/private/var/containers/Data/System/*/Library/activation_records/activation_record.plist activation_records/$CACHED_SERIAL/activation_record.plist
-            sudo ./bin/sshpass -p "$sshpwd" scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no $CONNECT_AS@"$ip_address":/private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sisv activation_records/$CACHED_SERIAL/IC-Info.sisv
-            sudo ./bin/sshpass -p "$sshpwd" scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no $CONNECT_AS@"$ip_address":/private/var/wireless/Library/Preferences/com.apple.commcenter.device_specific_nobackup.plist activation_records/$CACHED_SERIAL/com.apple.commcenter.device_specific_nobackup.plist
-        fi
+find_one() { find "$1" -type f -name "$2" ! -name '._*' 2>/dev/null | head -n 1 || true; }
 
-        echo "[*] Forging the custom IPSW..."
-        savedir="noseprestore/$IDENTIFIER/$IOS_VERSION"
-        mkdir -p "$savedir"
-        unzip "$TARGET_IPSW" -d tmp1
-        unzip "$BASE_IPSW" -d tmp2
-        
-        KEY_FILE="keys/$IDENTIFIER.txt"
-        IBSS_KEY=$(grep "ibss-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-        IBEC_KEY=$(grep "ibec-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-        DTRE_KEY=$(grep "dtre-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-        RDSK_KEY=$(grep "rdsk-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-        KRNL_KEY=$(grep "krnl-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-        ROOT_KEY=$(grep "fstm-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
+pick_ipsw() { # optional preset
+  local p="${1:-${IPSW:-}}"
+  if [[ -z "$p" ]] && command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    p="$(zenity --file-selection --title="Select the iOS $2 IPSW" 2>/dev/null || true)"
+  fi
+  if [[ -z "$p" ]]; then read -r -e -p "Path to the iOS $2 IPSW: " p; fi
+  [[ -f "$p" ]] || die "IPSW not found: $p"
+  printf '%s\n' "$p"
+}
 
-        smallest_dmg=$(find_dmg tmp1 smallest)
-        smallest12_dmg=$(find_dmg tmp2 smallest)
-        rootfs_dmg=$(find_dmg tmp1 largest)
-        rootfs12_dmg=$(find_dmg tmp2 largest)
-        mkdir work
-        rm -rf "$rootfs12_dmg"
+# ----------------------------------------------------------------------------
+# Activation records
+# ----------------------------------------------------------------------------
+SSH_OPTS=(-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR)
 
-        ./bin/img4 -i "$smallest_dmg" -o "$smallest12_dmg" -k $RDSK_KEY -D
-        
-        echo "[*] Patchin' ASR and the Restored External... hoist the colors!"
-        ./bin/img4 -i "$smallest_dmg" -o "work/ramdisk.raw" -k $RDSK_KEY 
-        ./bin/hfsplus "work/ramdisk.raw" grow 30000000
-        ./bin/hfsplus "work/ramdisk.raw" extract usr/sbin/asr
-        ./bin/asr64_patcher asr asr_patch 
-        ./bin/ldid -e asr > ents.plist
-        ./bin/ldid -Sents.plist asr_patch
-        ./bin/hfsplus "work/ramdisk.raw" rm usr/sbin/asr
-        ./bin/hfsplus "work/ramdisk.raw" add asr_patch usr/sbin/asr
-        ./bin/hfsplus "work/ramdisk.raw" chmod 100755 usr/sbin/asr
+scp_get() { # pw ip remote local
+  "$ROOT/bin/sshpass" -p "$1" scp -O "${SSH_OPTS[@]}" "root@$2:$3" "$4" 2>/dev/null ||
+  "$ROOT/bin/sshpass" -p "$1" scp    "${SSH_OPTS[@]}" "root@$2:$3" "$4"
+}
 
-        ./bin/hfsplus "work/ramdisk.raw" extract usr/local/bin/restored_external
-        ./bin/restoredpatcher restored_external restored_patch -b
-        ./bin/ldid -e restored_external > ents.plist
-        ./bin/ldid -Sents.plist restored_patch
-        ./bin/hfsplus "work/ramdisk.raw" rm usr/local/bin/restored_external
-        ./bin/hfsplus "work/ramdisk.raw" add restored_patch usr/local/bin/restored_external
-        ./bin/hfsplus "work/ramdisk.raw" chmod 100755 usr/local/bin/restored_external
+fetch_activation() {
+  local dir="activation_records/$ECID_DEC"
+  if [[ -s "$dir/activation_record.plist" && -s "$dir/IC-Info.sisv" && -s "$dir/com.apple.commcenter.device_specific_nobackup.plist" ]]; then
+    ok "Using stored activation records ($dir)"; return 0
+  fi
+  if [[ -n "$SERIAL" && -s "activation_records/$SERIAL/activation_record.plist" ]]; then
+    mkdir -p "$dir"; cp -r "activation_records/$SERIAL/." "$dir/"; ok "Migrated records from serial folder"; return 0
+  fi
+  [[ "$MODE_NOW" == "normal" ]] || die "Activation records are missing. Boot the phone normally (activated, jailbroken, OpenSSH installed) and rerun."
+  warn "Activation records REQUIRED. Phone must be on its latest iOS, activated, jailbroken, with OpenSSH."
+  local ip pw
+  read -r -p "Device IP: " ip
+  read -r -s -p "SSH password for root (usually 'alpine'): " pw; echo
+  mkdir -p "$dir"
+  scp_get "$pw" "$ip" "/private/var/containers/Data/System/*/Library/activation_records/activation_record.plist" "$dir/activation_record.plist"
+  scp_get "$pw" "$ip" "/private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sisv" "$dir/IC-Info.sisv"
+  scp_get "$pw" "$ip" "/private/var/wireless/Library/Preferences/com.apple.commcenter.device_specific_nobackup.plist" "$dir/com.apple.commcenter.device_specific_nobackup.plist"
+  ok "Activation records saved."
+}
 
-        curl -L -o options.n61.plist https://github.com/pwnerblu/surrealra1n/raw/refs/heads/development/dualboot/options.n61.plist
-        ./bin/hfsplus "work/ramdisk.raw" rm usr/local/share/restore/options.n61.plist
-        ./bin/hfsplus "work/ramdisk.raw" add options.n61.plist usr/local/share/restore/options.n61.plist
+# ----------------------------------------------------------------------------
+# springboard prefs: auto-lock = Never  (screen lock/sleep is what panics a SEP-less boot)
+# ----------------------------------------------------------------------------
+write_nosleep_plist() { # output path
+  cat >"$1" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>SBAutoLockTime</key>
+	<integer>-1</integer>
+</dict>
+</plist>
+EOF
+}
 
-        ./bin/img4 -i "work/ramdisk.raw" -o "$smallest12_dmg" -A -T rdsk
-        ./bin/dmg extract "$rootfs_dmg" "tmp1/rootfs.raw" -k $ROOT_KEY
-        ./bin/hfsplus "tmp1/rootfs.raw" grow 3500000000
-        
-        echo "Stitching activation files into the rootfs..."
-        sudo cp activation_records/$CACHED_SERIAL/activation_record.plist activation.plist
-        sudo cp activation_records/$CACHED_SERIAL/IC-Info.sisv IC-Info.sisv
-        sudo cp activation_records/$CACHED_SERIAL/com.apple.commcenter.device_specific_nobackup.plist com.apple.commcenter.device_specific_nobackup.plist
-        
-        ./bin/hfsplus "tmp1/rootfs.raw" mkdir private/var/root/Library/Lockdown/activation_records
-        ./bin/hfsplus "tmp1/rootfs.raw" mkdir private/var/mobile/Library/mad/activation_records
-        ./bin/hfsplus "tmp1/rootfs.raw" mkdir private/var/mobile/Library/FairPlay/iTunes_Control/iTunes
-        ./bin/hfsplus "tmp1/rootfs.raw" mkdir private/var/wireless
-        ./bin/hfsplus "tmp1/rootfs.raw" mkdir private/var/wireless/Library
-        ./bin/hfsplus "tmp1/rootfs.raw" mkdir private/var/wireless/Library/Preferences
+# ----------------------------------------------------------------------------
+# Command: build custom IPSW
+# ----------------------------------------------------------------------------
+cmd_ipsw() {
+  local target_ipsw="${1:-}" base_ipsw="${2:-}" ver="${3:-$TARGET_DEFAULT}"
+  [[ "$ver" == --* ]] && ver="$TARGET_DEFAULT"
+  [[ -f "$target_ipsw" ]] || die "Target IPSW not found: '$target_ipsw'"
+  [[ -f "$base_ipsw"   ]] || die "Base IPSW not found: '$base_ipsw'"
+  [[ "$ver" == "8.3" ]] || warn "This build is tuned for 8.3 - proceeding with $ver."
 
-        ./bin/hfsplus "tmp1/rootfs.raw" add activation.plist private/var/root/Library/Lockdown/activation_records/activation_record.plist
-        ./bin/hfsplus "tmp1/rootfs.raw" add activation.plist private/var/mobile/Library/mad/activation_records/activation_record.plist
-        ./bin/hfsplus "tmp1/rootfs.raw" add IC-Info.sisv private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sisv
-        sudo ./bin/hfsplus "tmp1/rootfs.raw" add com.apple.commcenter.device_specific_nobackup.plist private/var/wireless/Library/Preferences/com.apple.commcenter.device_specific_nobackup.plist
-        
-        ./bin/hfsplus "tmp1/rootfs.raw" chmod 666 private/var/root/Library/Lockdown/activation_records/activation_record.plist
-        ./bin/hfsplus "tmp1/rootfs.raw" chmod 666 private/var/mobile/Library/mad/activation_records/activation_record.plist
-        ./bin/hfsplus "tmp1/rootfs.raw" chmod 664 private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sisv
-        ./bin/hfsplus "tmp1/rootfs.raw" chmod 600 private/var/wireless/Library/Preferences/com.apple.commcenter.device_specific_nobackup.plist
-        
-        sudo rm -rf activation.plist IC-Info.sisv com.apple.commcenter.device_specific_nobackup.plist
-        ./bin/dmg build "tmp1/rootfs.raw" "$rootfs12_dmg"
+  detect_device
+  fetch_activation
+  load_keys "$ver" ibss ibec dtre rdsk krnl fstm
 
-        ./bin/img4 -i "tmp1/Firmware/all_flash/$ALLFLASH/$DEVICETREE" -o "work/dtre.raw" -k $DTRE_KEY
-        perl -pi -e 's/content-protect/content-protecV/g' work/dtre.raw 
-        ./bin/img4 -i "work/dtre.raw" -o "tmp2/Firmware/all_flash/$DEVICETREE" -A -T rdtr
-        
-        mv "tmp1/Firmware/dfu/$IBSS10" "tmp1/Firmware/dfu/$IBSS7"
-        mv "tmp1/Firmware/dfu/$IBEC10" "tmp1/Firmware/dfu/$IBEC7"
-        ./bin/img4 -i "tmp1/Firmware/dfu/$IBSS7" -o "work/iBSS.dec" -k "$IBSS_KEY"
-        ./bin/img4 -i "tmp1/Firmware/dfu/$IBEC7" -o "work/iBEC.dec" -k "$IBEC_KEY"
-        
-        ./bin/ipatcher work/iBSS.dec work/iBSS.patched
-        ./bin/ipatcher work/iBEC.dec work/iBEC.patched -b "rd=md0 debug=0x2014e -v wdt=-1 nand-enable-reformat=1 -restore amfi=0xff cs_enforcement_disable=1"
-        
-        ./bin/img4 -i "work/iBSS.patched" -o "tmp2/Firmware/dfu/$IBSS" -A -T ibss   
-        ./bin/img4 -i "work/iBEC.patched" -o "tmp2/Firmware/dfu/$IBEC" -A -T ibec 
-        ./bin/img4 -i "tmp1/$KERNELCACHE10" -o "work/kcache.raw" -k $KRNL_KEY  
-        ./bin/img4 -i "tmp1/$KERNELCACHE10" -o "work/kcache.im4p" -k $KRNL_KEY -D
-        
-        ./bin/Kernel64Patcher2 "work/kcache.raw" "work/kcache.patched" -u 8 -t -p -e 8 -f 8 -a -m 8 -g -s -d
-        ./bin/kerneldiff "work/kcache.raw" "work/kcache.patched" "work/kcache.bpatch"
-        ./bin/img4 -i "work/kcache.im4p" -o "tmp2/$KERNELCACHE" -T rkrn -P "work/kcache.bpatch" -J || true
-        
-        echo "[*] Packaging the plunder..."
-        rm -rf "work" "tmp1"
-        cd tmp2
-        zip -0 -r ../$savedir/custom.ipsw *
-        cd ..
-        rm -rf "tmp2"
-        echo "[*] IPSW forged! Run: ./downgrade.sh --seprmvr64-restore $IOS_VERSION"
-        exit 0
-        ;;
+  local avail; avail="$(df --output=avail -k . | tail -n 1 | tr -d ' ')"
+  (( avail > 14 * 1024 * 1024 )) || die "Need ~14 GB free in $(pwd)."
 
-    --seprmvr64-restore)
-        IOS_VERSION="$2"
-        savedir="noseprestore/$IDENTIFIER/$IOS_VERSION"
-        rm -rf "shsh"
-        mkdir -p shsh
-        sudo ./bin/tsschecker -d $IDENTIFIER -s -e $ECID -i $LATEST_VERSION --save-path shsh
+  local savedir="noseprestore/$IDENTIFIER/$ver" act="activation_records/$ECID_DEC"
+  rm -rf tmp1 tmp2 work
+  mkdir -p "$savedir" work cache
+  log "Unpacking IPSWs..."
+  unzip -q "$target_ipsw" -d tmp1
+  unzip -q "$base_ipsw"   -d tmp2
 
-        shshpath=$(find shsh -type f -name "*.shsh2" | head -n 1)
-        
-        echo "[*] Put yer vessel in PWNDFU mode. Pwning with gaster..."
-        ./bin/gaster pwn
-        ./bin/gaster reset
-        
-        irecovery_output=$(./bin/irecovery -q)
-        if echo "$irecovery_output" | grep -q "PWND"; then
-            echo "[*] PWNDFU verified!"
-        else
-            echo "[!] Not in PWNDFU. Do it properly, matey!"
-            exit 1
-        fi
-        
-        sudo LD_LIBRARY_PATH="lib" ./bin/idevicerestore -e $savedir/custom.ipsw -y
-        echo "[*] Restore complete! NOW YE MUST RUN: ./downgrade.sh --fix-ios8"
-        exit 0
-        ;;
+  local t_rd t_root b_rd b_root
+  t_rd="$(pick_dmg tmp1 RestoreRamDisk smallest)"; t_root="$(pick_dmg tmp1 OS largest)"
+  b_rd="$(pick_dmg tmp2 RestoreRamDisk smallest)"; b_root="$(pick_dmg tmp2 OS largest)"
+  [[ -n "$t_rd" && -n "$t_root" && -n "$b_rd" && -n "$b_root" ]] || die "Could not locate ramdisk/rootfs DMGs."
 
-    --fix-ios8)
-        echo "[!] Ye must boot an SSH ramdisk with Legacy iOS Kit first to fix dyld."
-        read -p "Press enter when the ramdisk is booted and ready..."
-        echo "[*] Patching dyld. This might take a few turns of the hourglass..."
-        ./bin/sshpass -p "alpine" ssh root@127.0.0.1 -p6414 -o StrictHostKeyChecking=no "/sbin/mount_hfs /dev/disk0s1s1 /mnt1 || true"
-        ./bin/sshpass -p "alpine" scp -P6414 -o StrictHostKeyChecking=no root@localhost:/mnt1/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64 dyld.raw
-        ./bin/dsc64patcher dyld.raw dyld.patched -8
-        ./bin/sshpass -p "alpine" scp -P6414 -o StrictHostKeyChecking=no dyld.patched root@localhost:/mnt1/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64
-        rm -rf dyld.patched dyld.raw
-        ./bin/sshpass -p "alpine" ssh root@127.0.0.1 -p6414 -o StrictHostKeyChecking=no "/sbin/reboot || true"
-        echo "[*] Dyld fixed! Ye can now tether boot."
-        exit 0
-        ;;
+  # ---- ramdisk: patch ASR + restored_external ----
+  log "Patching ASR and restored_external..."
+  ./bin/img4 -i "$t_rd" -o work/ramdisk.raw -k "$KEY_RDSK"
+  ./bin/hfsplus work/ramdisk.raw grow 30000000
+  ./bin/hfsplus work/ramdisk.raw extract usr/sbin/asr
+  ./bin/asr64_patcher asr asr_patch
+  ./bin/ldid -e asr > ents.plist
+  ./bin/ldid -Sents.plist asr_patch
+  ./bin/hfsplus work/ramdisk.raw rm usr/sbin/asr
+  ./bin/hfsplus work/ramdisk.raw add asr_patch usr/sbin/asr
+  ./bin/hfsplus work/ramdisk.raw chmod 100755 usr/sbin/asr
+  ./bin/hfsplus work/ramdisk.raw extract usr/local/bin/restored_external
+  ./bin/restoredpatcher restored_external restored_patch -b
+  ./bin/ldid -e restored_external > ents.plist
+  ./bin/ldid -Sents.plist restored_patch
+  ./bin/hfsplus work/ramdisk.raw rm usr/local/bin/restored_external
+  ./bin/hfsplus work/ramdisk.raw add restored_patch usr/local/bin/restored_external
+  ./bin/hfsplus work/ramdisk.raw chmod 100755 usr/local/bin/restored_external
+  [[ -s cache/options.n61.plist ]] || curl -fL -o cache/options.n61.plist \
+    https://github.com/pwnerblu/surrealra1n/raw/refs/heads/development/dualboot/options.n61.plist
+  ./bin/hfsplus work/ramdisk.raw rm usr/local/share/restore/options.n61.plist || true
+  ./bin/hfsplus work/ramdisk.raw add cache/options.n61.plist usr/local/share/restore/options.n61.plist
+  ./bin/img4 -i work/ramdisk.raw -o "$b_rd" -A -T rdsk
 
-    --seprmvr64-boot)
-        IOS_VERSION="$2"
-        savedir="seprmvr64boot/$IDENTIFIER/$IOS_VERSION"
-        shshpath=$(find shsh -type f -name "*.shsh2" | head -n 1)
-        
-        if [[ ! -d "$savedir" ]] || [[ ! -f "$savedir"/iBSS.img4 || ! -f "$savedir"/iBEC.img4 || ! -f "$savedir"/DeviceTree.img4 || ! -f "$savedir"/Kernelcache.img4 ]]; then
-            echo "[*] Fetching boot files from the IPSW..."
-            IPSW_PATH=$($zenity --file-selection --title="Select the iOS $IOS_VERSION IPSW file")
-            rm -rf "$savedir"
-            mkdir -p "$savedir" work tmp1
-            unzip "$IPSW_PATH" -d tmp1
-            
-            KEY_FILE="keys/$IDENTIFIER.txt"
-            ./bin/img4tool -s "$shshpath" -e -m "$IDENTIFIER-im4m"
-            im4m="$IDENTIFIER-im4m"
+  # ---- rootfs ----
+  log "Extracting rootfs ($ver)..."
+  ./bin/dmg extract "$t_root" tmp1/rootfs.raw -k "$KEY_FSTM"
+  ./bin/hfsplus tmp1/rootfs.raw grow 3500000000
+  local R=tmp1/rootfs.raw
+  hfs() { ./bin/hfsplus "$R" "$@"; }
 
-            IBSS_KEY=$(grep "ibss-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-            IBEC_KEY=$(grep "ibec-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-            DTRE_KEY=$(grep "dtre-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
-            KRNL_KEY=$(grep "krnl-$IOS_VERSION:" "$KEY_FILE" | cut -d':' -f2 | xargs)
+  log "Stitching activation files..."
+  local d
+  for d in private/var/root/Library/Lockdown private/var/root/Library/Lockdown/activation_records \
+           private/var/mobile/Library/mad private/var/mobile/Library/mad/activation_records \
+           private/var/mobile/Library/FairPlay private/var/mobile/Library/FairPlay/iTunes_Control \
+           private/var/mobile/Library/FairPlay/iTunes_Control/iTunes \
+           private/var/wireless private/var/wireless/Library private/var/wireless/Library/Preferences; do
+    hfs mkdir "$d" >/dev/null 2>&1 || true
+  done
+  hfs add "$act/activation_record.plist" private/var/root/Library/Lockdown/activation_records/activation_record.plist
+  hfs add "$act/activation_record.plist" private/var/mobile/Library/mad/activation_records/activation_record.plist
+  hfs add "$act/IC-Info.sisv" private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sisv
+  hfs add "$act/com.apple.commcenter.device_specific_nobackup.plist" private/var/wireless/Library/Preferences/com.apple.commcenter.device_specific_nobackup.plist
+  hfs chmod 666 private/var/root/Library/Lockdown/activation_records/activation_record.plist
+  hfs chmod 666 private/var/mobile/Library/mad/activation_records/activation_record.plist
+  hfs chmod 664 private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sisv
+  hfs chmod 600 private/var/wireless/Library/Preferences/com.apple.commcenter.device_specific_nobackup.plist
 
-            ./bin/img4 -i "tmp1/Firmware/all_flash/$ALLFLASH/$DEVICETREE" -o "work/dtre.raw" -k $DTRE_KEY
-            ./bin/img4 -i "work/dtre.raw" -o "$savedir/DeviceTree.img4" -A -T rdtr -M $im4m
-            
-            mv "tmp1/Firmware/dfu/$IBSS10" "tmp1/Firmware/dfu/$IBSS7"
-            mv "tmp1/Firmware/dfu/$IBEC10" "tmp1/Firmware/dfu/$IBEC7"
-            
-            ./bin/img4 -i "tmp1/Firmware/dfu/$IBSS7" -o "work/iBSS.dec" -k $IBSS_KEY
-            ./bin/img4 -i "tmp1/Firmware/dfu/$IBEC7" -o "work/iBEC.dec" -k $IBEC_KEY
-            
-            ./bin/ipatcher work/iBSS.dec work/iBSS.patched
-            ./bin/ipatcher work/iBEC.dec work/iBEC.patched -b "-v rd=disk0s1s1"
-            
-            ./bin/img4 -i "work/iBSS.patched" -o "$savedir/iBSS.img4" -A -T ibss -M $im4m 
-            ./bin/img4 -i "work/iBEC.patched" -o "$savedir/iBEC.img4" -A -T ibec -M $im4m
-            
-            ./bin/img4 -i "tmp1/$KERNELCACHE10" -o "work/kcache.raw" -k $KRNL_KEY  
-            ./bin/img4 -i "tmp1/$KERNELCACHE10" -o "work/kcache.im4p" -k $KRNL_KEY -D
-            
-            ./bin/Kernel64Patcher2 "work/kcache.raw" "work/kcache.patched" -u 8 -t -p -e 8 -f 8 -a -m 8 -g -s -d
-            ./bin/kerneldiff "work/kcache.raw" "work/kcache.patched" "work/kcache.bpatch"
-            ./bin/img4 -i "work/kcache.im4p" -o "$savedir/Kernelcache.img4" -T rkrn -P "work/kcache.bpatch" -J -M $im4m || true
-            
-            rm -rf "work" "tmp1"
-        fi
+  log "Deleting Setup.app..."
+  if ! hfs rmall Applications/Setup.app >/dev/null 2>&1; then hfs rm Applications/Setup.app >/dev/null 2>&1 || true; fi
+  if hfs ls Applications 2>/dev/null | grep -q 'Setup.app'; then
+    warn "Setup.app is still present (your hfsplus build may lack 'rmall'). Run --fix-ios8 afterwards, it deletes it over SSH."
+  else
+    ok "Setup.app removed."
+  fi
 
-        echo "[*] Put yer vessel in PWNDFU mode..."
-        ./bin/gaster pwn
-        ./bin/gaster reset
-        
-        irecovery_output=$(./bin/irecovery -q)
-        if ! echo "$irecovery_output" | grep -q "PWND"; then
-            echo "[!] Not in PWNDFU! Overboard with ye!"
-            exit 1
-        fi
-        
-        ./bin/irecovery -f $savedir/iBSS.img4
-        ./bin/irecovery -f $savedir/iBEC.img4
-        ./bin/irecovery -f $savedir/DeviceTree.img4
-        ./bin/irecovery -c devicetree
-        ./bin/irecovery -f $savedir/Kernelcache.img4
-        ./bin/irecovery -c bootx
-        echo "[*] She's set sail! Yer device should boot now."
-        exit 0
-        ;;
+  log "Disabling auto-lock (prevents the lock-screen sleep panic)..."
+  write_nosleep_plist work/com.apple.springboard.plist
+  hfs mkdir private/var/mobile/Library/Preferences >/dev/null 2>&1 || true
+  hfs rm private/var/mobile/Library/Preferences/com.apple.springboard.plist >/dev/null 2>&1 || true
+  hfs add work/com.apple.springboard.plist private/var/mobile/Library/Preferences/com.apple.springboard.plist
+  hfs chmod 644 private/var/mobile/Library/Preferences/com.apple.springboard.plist
+  hfs chown 501 501 private/var/mobile/Library/Preferences/com.apple.springboard.plist >/dev/null 2>&1 || true
 
-    *)
-        echo "[!] Unknown command. Consult the map!"
-        usage
-        exit 1
-        ;;
-esac
+  rm -f "$b_root"
+  ./bin/dmg build "$R" "$b_root"
+
+  # ---- DeviceTree ----
+  log "Patching DeviceTree..."
+  local t_dt b_dt
+  t_dt="$(find_one tmp1/Firmware/all_flash "DeviceTree.$BOARD.im4p")"
+  b_dt="$(find_one tmp2/Firmware/all_flash "DeviceTree.$BOARD.im4p")"
+  [[ -n "$t_dt" && -n "$b_dt" ]] || die "DeviceTree not found in one of the IPSWs."
+  ./bin/img4 -i "$t_dt" -o work/dtre.raw -k "$KEY_DTRE"
+  perl -pi -e 's/content-protect/content-protecV/g' work/dtre.raw
+  ./bin/img4 -i work/dtre.raw -o "$b_dt" -A -T rdtr
+
+  # ---- iBSS / iBEC (file names differ between 8.x and 12.x, so resolve them) ----
+  log "Patching iBSS/iBEC..."
+  local t_ibss t_ibec b_ibss b_ibec
+  t_ibss="$(find_one tmp1/Firmware/dfu 'iBSS.n61*')"; t_ibec="$(find_one tmp1/Firmware/dfu 'iBEC.n61*')"
+  b_ibss="$(find_one tmp2/Firmware/dfu 'iBSS.n61*')"; b_ibec="$(find_one tmp2/Firmware/dfu 'iBEC.n61*')"
+  [[ -n "$t_ibss" && -n "$t_ibec" && -n "$b_ibss" && -n "$b_ibec" ]] || die "iBSS/iBEC not found in Firmware/dfu."
+  ./bin/img4 -i "$t_ibss" -o work/iBSS.dec -k "$KEY_IBSS"
+  ./bin/img4 -i "$t_ibec" -o work/iBEC.dec -k "$KEY_IBEC"
+  ./bin/ipatcher work/iBSS.dec work/iBSS.patched
+  ./bin/ipatcher work/iBEC.dec work/iBEC.patched -b "$RESTORE_BOOTARGS"
+  ./bin/img4 -i work/iBSS.patched -o "$b_ibss" -A -T ibss
+  ./bin/img4 -i work/iBEC.patched -o "$b_ibec" -A -T ibec
+
+  # ---- kernelcache ----
+  log "Patching kernelcache..."
+  local t_kc b_kc
+  t_kc="$(find_one tmp1 'kernelcache.release.n61*')"; b_kc="$(find_one tmp2 'kernelcache.release.n61*')"
+  [[ -n "$t_kc" && -n "$b_kc" ]] || die "kernelcache not found."
+  ./bin/img4 -i "$t_kc" -o work/kcache.raw -k "$KEY_KRNL"
+  ./bin/img4 -i "$t_kc" -o work/kcache.im4p -k "$KEY_KRNL" -D
+  ./bin/Kernel64Patcher2 work/kcache.raw work/kcache.patched -u 8 -t -p -e 8 -f 8 -a -m 8 -g -s -d
+  ./bin/kerneldiff work/kcache.raw work/kcache.patched work/kcache.bpatch
+  ./bin/img4 -i work/kcache.im4p -o "$b_kc" -T rkrn -P work/kcache.bpatch -J || true
+
+  log "Packaging IPSW..."
+  rm -f "$savedir/custom.ipsw"
+  ( cd tmp2 && zip -0 -r -q "$ROOT/$savedir/custom.ipsw" . )
+  rm -rf work tmp1 tmp2 asr asr_patch restored_external restored_patch ents.plist
+  ok "IPSW ready: $savedir/custom.ipsw"
+  log "Next: $0 --restore $ver"
+}
+
+# ----------------------------------------------------------------------------
+# Command: restore
+# ----------------------------------------------------------------------------
+cmd_restore() {
+  local ver="${1:-$TARGET_DEFAULT}" savedir
+  savedir="noseprestore/$IDENTIFIER/$ver"
+  [[ -f "$savedir/custom.ipsw" ]] || die "No $savedir/custom.ipsw - run --ipsw first."
+  detect_device
+
+  log "Saving SHSH blobs for $LATEST_VERSION (used for tethered boot)..."
+  rm -rf shsh; mkdir -p shsh
+  as_root "$ROOT/bin/tsschecker" -d "$IDENTIFIER" -B "$BOARD" -s -e "$ECID_DEC" -i "$LATEST_VERSION" --save-path shsh || true
+  [[ -n "$(find shsh -type f -name '*.shsh2' 2>/dev/null | head -n 1)" ]] ||
+    die "No SHSH saved. Is $LATEST_VERSION still signed for iPhone 6 and are you online?"
+
+  pwn_device
+  start_usbmuxd                     # restore mode needs usbmuxd again
+  log "Restoring (do not unplug)..."
+  as_root "$ROOT/bin/idevicerestore" -e "$savedir/custom.ipsw" -y
+  ok "Restore finished. NEXT: $0 --fix-ios8   then   $0 boot $ver"
+}
+
+# ----------------------------------------------------------------------------
+# Command: fix-ios8 (dyld + Setup.app + no sleep) over SSH ramdisk
+# ----------------------------------------------------------------------------
+cmd_fix_ios8() {
+  warn "Boot an SSH ramdisk first (e.g. Legacy iOS Kit) and expose it on localhost:$SSH_PORT."
+  if command -v iproxy >/dev/null 2>&1 && ! (exec 3<>"/dev/tcp/127.0.0.1/$SSH_PORT") 2>/dev/null; then
+    log "Starting iproxy $SSH_PORT 22..."
+    (iproxy "$SSH_PORT" 22 >/dev/null 2>&1 &)
+    sleep 2
+  fi
+  read -r -p "Press Enter when the ramdisk is booted and ready... " _
+
+  local sshc=("$ROOT/bin/sshpass" -p alpine ssh -p "$SSH_PORT" "${SSH_OPTS[@]}" root@127.0.0.1)
+  local scpc=("$ROOT/bin/sshpass" -p alpine scp -P "$SSH_PORT" "${SSH_OPTS[@]}")
+
+  "${sshc[@]}" "/sbin/mount_hfs /dev/disk0s1s1 /mnt1 || true"
+  "${sshc[@]}" "/sbin/mount_hfs /dev/disk0s1s2 /mnt2 || true"
+
+  log "Patching dyld shared cache..."
+  "${scpc[@]}" "root@127.0.0.1:/mnt1/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64" dyld.raw
+  ./bin/dsc64patcher dyld.raw dyld.patched -8
+  "${scpc[@]}" dyld.patched "root@127.0.0.1:/mnt1/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
+  rm -f dyld.raw dyld.patched
+
+  log "Deleting Setup.app..."
+  "${sshc[@]}" "rm -rf /mnt1/Applications/Setup.app" || warn "Could not delete Setup.app."
+
+  log "Disabling auto-lock/sleep..."
+  local tmp; tmp="$(mktemp)"; write_nosleep_plist "$tmp"
+  "${sshc[@]}" "mkdir -p /mnt2/mobile/Library/Preferences /mnt1/private/var/mobile/Library/Preferences" || true
+  "${scpc[@]}" "$tmp" "root@127.0.0.1:/mnt2/mobile/Library/Preferences/com.apple.springboard.plist" || warn "Could not write prefs to /mnt2."
+  "${scpc[@]}" "$tmp" "root@127.0.0.1:/mnt1/private/var/mobile/Library/Preferences/com.apple.springboard.plist" || true
+  "${sshc[@]}" "chown 501:501 /mnt2/mobile/Library/Preferences/com.apple.springboard.plist; chmod 644 /mnt2/mobile/Library/Preferences/com.apple.springboard.plist" || true
+  rm -f "$tmp"
+
+  "${sshc[@]}" "/sbin/reboot || true" || true
+  ok "Done. Now tethered boot: $0 boot"
+}
+
+# ----------------------------------------------------------------------------
+# Command: tethered boot
+# ----------------------------------------------------------------------------
+cmd_boot() {
+  local ver="${1:-$TARGET_DEFAULT}" ipsw_arg="${2:-}" savedir
+  savedir="seprmvr64boot/$IDENTIFIER/$ver"
+  local shsh; shsh="$(find shsh -type f -name '*.shsh2' 2>/dev/null | head -n 1 || true)"
+  [[ -n "$shsh" ]] || die "No SHSH in ./shsh - run --restore once first (it saves them)."
+
+  if [[ ! -f "$savedir/iBSS.img4" || ! -f "$savedir/iBEC.img4" || ! -f "$savedir/DeviceTree.img4" || ! -f "$savedir/Kernelcache.img4" ]]; then
+    local ipsw; ipsw="$(pick_ipsw "$ipsw_arg" "$ver")"
+    load_keys "$ver" ibss ibec dtre krnl
+    rm -rf "$savedir" work tmp1
+    mkdir -p "$savedir" work tmp1
+    log "Building boot files from the IPSW..."
+    unzip -q "$ipsw" -d tmp1
+    ./bin/img4tool -s "$shsh" -e -m work/im4m
+
+    local dt ibss ibec kc
+    dt="$(find_one tmp1/Firmware/all_flash "DeviceTree.$BOARD.im4p")"
+    ibss="$(find_one tmp1/Firmware/dfu 'iBSS.n61*')"; ibec="$(find_one tmp1/Firmware/dfu 'iBEC.n61*')"
+    kc="$(find_one tmp1 'kernelcache.release.n61*')"
+    [[ -n "$dt" && -n "$ibss" && -n "$ibec" && -n "$kc" ]] || die "Boot components not found in that IPSW (is it the iPhone 6 $ver IPSW?)."
+
+    ./bin/img4 -i "$dt" -o work/dtre.raw -k "$KEY_DTRE"
+    ./bin/img4 -i work/dtre.raw -o "$savedir/DeviceTree.img4" -A -T rdtr -M work/im4m
+    ./bin/img4 -i "$ibss" -o work/iBSS.dec -k "$KEY_IBSS"
+    ./bin/img4 -i "$ibec" -o work/iBEC.dec -k "$KEY_IBEC"
+    ./bin/ipatcher work/iBSS.dec work/iBSS.patched
+    ./bin/ipatcher work/iBEC.dec work/iBEC.patched -b "$BOOT_BOOTARGS"
+    ./bin/img4 -i work/iBSS.patched -o "$savedir/iBSS.img4" -A -T ibss -M work/im4m
+    ./bin/img4 -i work/iBEC.patched -o "$savedir/iBEC.img4" -A -T ibec -M work/im4m
+    ./bin/img4 -i "$kc" -o work/kcache.raw -k "$KEY_KRNL"
+    ./bin/img4 -i "$kc" -o work/kcache.im4p -k "$KEY_KRNL" -D
+    ./bin/Kernel64Patcher2 work/kcache.raw work/kcache.patched -u 8 -t -p -e 8 -f 8 -a -m 8 -g -s -d
+    ./bin/kerneldiff work/kcache.raw work/kcache.patched work/kcache.bpatch
+    ./bin/img4 -i work/kcache.im4p -o "$savedir/Kernelcache.img4" -T rkrn -P work/kcache.bpatch -J -M work/im4m || true
+    rm -rf work tmp1
+  fi
+
+  pwn_device
+  log "Sending boot chain..."
+  irec_try -f "$savedir/iBSS.img4";        sleep 2
+  irec_try -f "$savedir/iBEC.img4";        sleep 1
+  if [[ -z "${SKIP_GO:-}" ]]; then irec_try -c go; fi
+  sleep 3
+  irec_try -f "$savedir/DeviceTree.img4"
+  irec_try -c devicetree
+  irec_try -f "$savedir/Kernelcache.img4"
+  irec_try -c bootx
+  ok "Booting. Do NOT lock the phone (auto-lock is already set to Never)."
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  [[ $# -gt 0 ]] || { usage; exit 1; }
+  echo "iPhone6Tether8.0 - $CURRENT_VERSION"
+  echo "Tethered downgrader strictly for the iPhone 6 ($IDENTIFIER) -> iOS $TARGET_DEFAULT"
+  echo
+  case "$1" in -h|--help) usage; exit 0 ;; esac
+  check_env
+  log "sudo is needed for USB access."
+  sudo -v || die "sudo required."
+
+  local cmd="$1"; shift
+  case "$cmd" in
+    --ipsw|--seprmvr64-ipsw)        cmd_ipsw "$@" ;;
+    --restore|--seprmvr64-restore)  cmd_restore "$@" ;;
+    --fix-ios8)                     cmd_fix_ios8 ;;
+    boot|--boot|--seprmvr64-boot)   cmd_boot "$@" ;;
+    *) warn "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
