@@ -13,4 +13,4 @@ Example:
 
 
 
-uses claude's code to fix problems
+uses claude's code to fix problems on code
