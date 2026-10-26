@@ -2,7 +2,7 @@
 
 A tethered downgrade tool for only iPhone 6 (had to make this for me)
 
-if there is an error, contact "TobyAndrewTest" from discord 
+if there is an error, contact "LotusDaExige" from discord 
 
 
 Example: 
@@ -12,4 +12,5 @@ Example:
 ./downgrade.sh boot
 
 
-note that i inspire pwnerblu for the method -_-, i dont have other ideas what binaries to install
+
+uses claude's code to fix problems
